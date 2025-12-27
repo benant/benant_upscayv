@@ -1,0 +1,5 @@
+# .gitignore
+temp_frames/
+upscaled_frames/
+output_*.mp4
+__pycache__/
