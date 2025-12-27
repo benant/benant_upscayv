@@ -32,13 +32,44 @@ https://github.com/benant/benant_upscayv
 
 ## 📦 설치 방법
 
+### Python 스크립트로 실행
+
 저장소 클론 또는 스크립트 복사
 
 필요 라이브러리 설치:
 
 ```Bash
+pip install -r requirements.txt
+```
+
+또는 개별 설치:
+
+```Bash
 pip install tqdm
 ```
+
+### 실행 파일(.exe)로 빌드
+
+Windows에서 실행 파일로 만들기:
+
+1. PyInstaller 설치:
+   ```Bash
+   pip install pyinstaller
+   ```
+
+2. 빌드 스크립트 실행:
+   ```Bash
+   build_exe.bat
+   ```
+
+   또는 수동으로 빌드:
+   ```Bash
+   pyinstaller --onefile --name upscayv --console --hidden-import multiprocessing --hidden-import concurrent.futures upscayv.py
+   ```
+
+3. 생성된 실행 파일 위치: `dist\upscayv.exe`
+
+> **참고**: 실행 파일은 Python이 설치되지 않은 컴퓨터에서도 실행할 수 있습니다. 단, FFmpeg과 Upscayl은 별도로 설치되어 있어야 합니다.
 
 ## ⚙️ 설정 (Configuration)
 
