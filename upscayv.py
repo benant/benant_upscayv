@@ -530,6 +530,9 @@ def run_upscale():
         # 5. AI 업스케일링 (폴더 전체를 배치로 처리)
         print(f"\n[2/3] 🤖 AI 업스케일링 시작 ({res_name})...")
         
+        # 업스케일링 작업 시작 시간 기록
+        upscale_start_time = time.time()
+        
         # 모델 폴더에서 사용 가능한 모델 찾기
         model_path_abs = os.path.abspath(MODEL_PATH) if os.path.exists(MODEL_PATH) else MODEL_PATH
         available_models = find_available_models(model_path_abs)
@@ -750,6 +753,25 @@ def run_upscale():
         final_count = len([f for f in os.listdir(UPSCALED_DIR) if f.endswith('.png')])
         if final_count < len(frame_files):
             print(f"\n⚠️ 경고: 예상 {len(frame_files)}개 프레임 중 {final_count}개만 생성되었습니다.")
+
+        # 업스케일링 작업 완료 시간 계산 및 표시
+        upscale_end_time = time.time()
+        upscale_elapsed = upscale_end_time - upscale_start_time
+        hours = int(upscale_elapsed // 3600)
+        minutes = int((upscale_elapsed % 3600) // 60)
+        seconds = int(upscale_elapsed % 60)
+        
+        if hours > 0:
+            time_str = f"{hours}시간 {minutes}분 {seconds}초"
+        elif minutes > 0:
+            time_str = f"{minutes}분 {seconds}초"
+        else:
+            time_str = f"{seconds}초"
+        
+        print(f"\n⏱️ 업스케일링 작업 완료: {time_str} ({upscale_elapsed:.2f}초)")
+        if len(frame_files) > 0:
+            avg_time_per_frame = upscale_elapsed / len(frame_files)
+            print(f"   평균 프레임당 처리 시간: {avg_time_per_frame:.2f}초")
 
         # 6. 최종 합성 (GPU 가속 사용)
         print(f"\n[3/3] 🎬 영상 합성 및 인코딩 중 (Encoder: {VIDEO_ENCODER})...")
