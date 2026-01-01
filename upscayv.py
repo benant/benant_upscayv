@@ -480,10 +480,42 @@ def run_upscale():
     else:
         print(f"\n6. 📺 현재 영상: {width}x{height} (비표준 해상도) - {fps} fps, 총 {total_frames} 프레임")
     
+    # 원본 영상의 비율 계산
+    aspect_ratio = width / height
+    
     # 목표 해상도 선택 메뉴 생성
     res_menu = ", ".join([f"{key}:{name}({w}x{h})" for key, (name, w, h) in RES_OPTIONS.items()])
     res_name, target_w, target_h = RES_OPTIONS.get(input(f"7. 목표 해상도 ({res_menu}): "), RES_OPTIONS["2"])
-    scale_factor = 4 if target_w / width > 2 else 2
+    
+    # 원본 비율을 유지하면서 목표 해상도에 맞춤
+    # 목표 해상도의 비율
+    target_aspect = target_w / target_h
+    
+    if aspect_ratio > target_aspect:
+        # 원본이 더 넓음 (가로가 더 긴 경우) - 높이를 기준으로 너비 계산
+        final_height = target_h
+        final_width = int(target_h * aspect_ratio)
+        # 최대 너비 제한 (목표 해상도보다 크지 않도록)
+        if final_width > target_w:
+            final_width = target_w
+            final_height = int(target_w / aspect_ratio)
+    else:
+        # 원본이 더 높음 (세로가 더 긴 경우) - 너비를 기준으로 높이 계산
+        final_width = target_w
+        final_height = int(target_w / aspect_ratio)
+        # 최대 높이 제한 (목표 해상도보다 크지 않도록)
+        if final_height > target_h:
+            final_height = target_h
+            final_width = int(target_h * aspect_ratio)
+    
+    # 짝수로 맞춤 (비디오 인코딩 호환성)
+    final_width = final_width - (final_width % 2)
+    final_height = final_height - (final_height % 2)
+    
+    # 최종 해상도 정보 표시
+    print(f"\n📐 원본 비율 유지: {width}x{height} → {final_width}x{final_height} (비율: {aspect_ratio:.2f})")
+    
+    scale_factor = 4 if final_width / width > 2 else 2
 
     # 3. 폴더 초기화
     cleanup()
@@ -734,7 +766,7 @@ def run_upscale():
         
         merge_cmd = (
             f'ffmpeg -y -framerate {fps} -i "{UPSCALED_DIR}/frame_%05d.png" -i "{selected_video}" '
-            f'-vf "scale={target_w}:{target_h}:flags=lanczos" '
+            f'-vf "scale={final_width}:{final_height}:flags=lanczos" '
             f'-c:v {VIDEO_ENCODER} {encoder_params} -pix_fmt yuv420p -c:a copy -map 0:v:0 -map 1:a:0? "{output_name}"'
         )
         subprocess.run(merge_cmd, shell=True, check=True)
