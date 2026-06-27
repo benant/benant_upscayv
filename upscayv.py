@@ -5,8 +5,10 @@ import json
 import shutil
 import time
 import argparse
+import tkinter as tk
 from datetime import datetime
 from pathlib import Path
+from tkinter import filedialog
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
@@ -389,6 +391,8 @@ def upscale_single_frame(args):
 
 TEMP_DIR = "temp_frames"
 UPSCALED_DIR = "upscaled_frames"
+WORK_TEMP_DIR = ".upscayv_temp"
+VIDEO_EXTENSIONS = {".mp4"}
 
 # 명령줄 인자 파싱
 def parse_arguments():
@@ -401,12 +405,20 @@ def parse_arguments():
   python upscayv.py              # 일반 모드로 실행
   python upscayv.py --debug       # 디버그 모드로 실행
   python upscayv.py -d            # 디버그 모드로 실행 (짧은 옵션)
+  python upscayv.py --input "D:\\videos"   # 폴더 일괄 처리
+  python upscayv.py --input "D:\\videos\\clip.mp4"  # 단일 파일 처리
         """
     )
     parser.add_argument(
         '-d', '--debug',
         action='store_true',
         help='디버그 모드 활성화 (상세한 디버그 메시지 출력)'
+    )
+    parser.add_argument(
+        '--input',
+        type=str,
+        default=None,
+        help='업스케일할 동영상 파일 또는 폴더 경로 (미지정 시 대화상자로 선택)'
     )
     return parser.parse_args()
 
@@ -434,6 +446,415 @@ def is_upscaled_output(filename):
     stem = os.path.splitext(filename)[0]
     res_pattern = '|'.join(re.escape(name) for name, _, _ in RES_OPTIONS.values())
     return re.match(rf'.+_({res_pattern})_M\d+_\d{{8}}_\d{{6}}$', stem) is not None
+
+def collect_videos(folder: Path) -> list[Path]:
+    """폴더 내 업스케일 대상 MP4 파일 목록을 반환합니다."""
+    videos = []
+    for item in sorted(folder.iterdir()):
+        if (
+            item.is_file()
+            and item.suffix.lower() in VIDEO_EXTENSIONS
+            and not is_upscaled_output(item.name)
+        ):
+            videos.append(item)
+    return videos
+
+def resolve_input_videos(input_path: str | None) -> tuple[list[Path], Path] | None:
+    """입력 경로 또는 대화상자로 동영상 목록과 저장 폴더를 결정합니다."""
+    if input_path:
+        path = Path(input_path).expanduser().resolve()
+        if not path.exists():
+            print(f"❌ 경로를 찾을 수 없습니다: {path}")
+            return None
+        if path.is_file():
+            if path.suffix.lower() not in VIDEO_EXTENSIONS:
+                print(f"❌ 지원하지 않는 파일 형식입니다: {path.suffix}")
+                return None
+            return [path], path.parent
+        if path.is_dir():
+            videos = collect_videos(path)
+            if not videos:
+                print(f"❌ 폴더에서 MP4 파일을 찾을 수 없습니다: {path}")
+                return None
+            return videos, path
+        print(f"❌ 유효하지 않은 경로입니다: {path}")
+        return None
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+
+    print("\n5. 📁 입력 선택")
+    print("  [1] 동영상 파일 선택")
+    print("  [2] 폴더 선택 (폴더 내 모든 MP4 일괄 처리)")
+
+    while True:
+        choice = input("선택 (1/2, 기본값: 1): ").strip() or "1"
+        if choice in ("1", "2"):
+            break
+        print("❌ 1 또는 2를 입력하세요.")
+
+    if choice == "2":
+        folder = filedialog.askdirectory(title="업스케일할 동영상 폴더 선택")
+        root.destroy()
+        if not folder:
+            print("❌ 폴더 선택이 취소되었습니다.")
+            return None
+        folder_path = Path(folder).resolve()
+        videos = collect_videos(folder_path)
+        if not videos:
+            print(f"❌ 폴더에서 MP4 파일을 찾을 수 없습니다: {folder_path}")
+            return None
+        return videos, folder_path
+
+    file_path = filedialog.askopenfilename(
+        title="업스케일할 동영상 선택",
+        filetypes=[("MP4 files", "*.mp4"), ("All files", "*.*")],
+    )
+    root.destroy()
+    if not file_path:
+        print("❌ 파일 선택이 취소되었습니다.")
+        return None
+    video_path = Path(file_path).resolve()
+    return [video_path], video_path.parent
+
+def calculate_final_dimensions(width, height, target_w, target_h):
+    """원본 비율을 유지하면서 목표 해상도에 맞는 최종 크기를 계산합니다."""
+    aspect_ratio = width / height
+    target_aspect = target_w / target_h
+
+    if aspect_ratio > target_aspect:
+        final_height = target_h
+        final_width = int(target_h * aspect_ratio)
+        if final_width > target_w:
+            final_width = target_w
+            final_height = int(target_w / aspect_ratio)
+    else:
+        final_width = target_w
+        final_height = int(target_w / aspect_ratio)
+        if final_height > target_h:
+            final_height = target_h
+            final_width = int(target_h * aspect_ratio)
+
+    final_width -= final_width % 2
+    final_height -= final_height % 2
+    return final_width, final_height, aspect_ratio
+
+def get_work_dirs(output_dir: Path) -> tuple[Path, Path]:
+    """작업용 임시 폴더 경로를 반환합니다."""
+    temp_base = output_dir / WORK_TEMP_DIR
+    return temp_base / TEMP_DIR, temp_base / UPSCALED_DIR
+
+def cleanup_work_dirs(temp_dir: Path, upscaled_dir: Path, verbose: bool = True):
+    """작업용 임시 폴더를 삭제합니다."""
+    temp_base = temp_dir.parent
+    if temp_base.exists():
+        shutil.rmtree(temp_base)
+    if verbose:
+        print("🧹 임시 파일 정리가 완료되었습니다.")
+
+def prompt_resolution():
+    """목표 해상도를 선택합니다."""
+    res_menu = ", ".join([f"{key}:{name}({w}x{h})" for key, (name, w, h) in RES_OPTIONS.items()])
+    res_name, target_w, target_h = RES_OPTIONS.get(
+        input(f"7. 목표 해상도 ({res_menu}): "), RES_OPTIONS["2"]
+    )
+    return res_name, target_w, target_h
+
+def prompt_model(model_path_abs: str):
+    """사용할 AI 모델을 선택합니다."""
+    available_models = find_available_models(model_path_abs)
+    if not available_models:
+        raise Exception(f"모델 폴더에서 사용 가능한 모델을 찾을 수 없습니다: {model_path_abs}")
+
+    fastest_model = get_fastest_model(available_models)
+    default_index = available_models.index(fastest_model) + 1 if fastest_model in available_models else 1
+
+    if len(available_models) == 1:
+        print(f"\n📦 사용할 모델: {available_models[0]} (자동 선택)")
+        return available_models[0], 1
+
+    print(f"\n📦 사용 가능한 모델:")
+    for i, model in enumerate(available_models, 1):
+        marker = " ⚡ (가장 빠름)" if model == fastest_model else ""
+        print(f"  [{i}] {model}{marker}")
+
+    while True:
+        try:
+            choice = input(f"\n모델 선택 (1-{len(available_models)}, 기본값: {default_index}): ").strip()
+            if not choice:
+                choice = str(default_index)
+            choice_num = int(choice)
+            if 1 <= choice_num <= len(available_models):
+                selected_model = available_models[choice_num - 1]
+                print(f"✅ 선택된 모델: {selected_model}")
+                return selected_model, choice_num
+            print(f"❌ 1부터 {len(available_models)} 사이의 숫자를 입력하세요.")
+        except ValueError:
+            print("❌ 숫자를 입력하세요.")
+        except KeyboardInterrupt:
+            raise
+
+def prompt_workers(recommended_workers: int, cpu_count: int) -> int:
+    """병렬 처리 워커 수를 선택합니다."""
+    print(f"\n[병렬 처리 설정]")
+    print(f"  권장 워커 수: {recommended_workers}")
+    try:
+        worker_input = input(
+            f"  사용할 워커 수 (기본값: {recommended_workers}, Enter로 기본값 사용): "
+        ).strip()
+        if worker_input:
+            num_workers = int(worker_input)
+            if num_workers < 1:
+                print("  ⚠️ 워커 수는 1 이상이어야 합니다. 기본값을 사용합니다.")
+                return recommended_workers
+            if num_workers > cpu_count * 2:
+                print(f"  ⚠️ 워커 수가 너무 많습니다. CPU 코어 수({cpu_count})의 2배를 초과합니다.")
+                confirm = input("  계속하시겠습니까? (y/n, 기본값: n): ").strip().lower()
+                if confirm != 'y':
+                    return recommended_workers
+            return num_workers
+    except (ValueError, KeyboardInterrupt):
+        print("  기본값을 사용합니다.")
+    return recommended_workers
+
+def run_frame_upscale(
+    temp_dir: Path,
+    upscaled_dir: Path,
+    scale_factor: int,
+    model_path_abs: str,
+    selected_model: str,
+    num_workers: int,
+    res_name: str,
+):
+    """추출된 프레임을 AI로 업스케일합니다."""
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    upscaled_dir.mkdir(parents=True, exist_ok=True)
+
+    frame_files = sorted([f for f in os.listdir(temp_dir) if f.endswith('.png')])
+    if not frame_files:
+        raise Exception(f"{temp_dir} 폴더에 프레임 파일이 없습니다.")
+
+    input_dir_abs = str(temp_dir.resolve())
+    output_dir_abs = str(upscaled_dir.resolve())
+
+    debug_print(f"\n[디버그] 입력 폴더: {input_dir_abs}")
+    debug_print(f"[디버그] 출력 폴더: {output_dir_abs}")
+    debug_print(f"[디버그] 모델: {selected_model}")
+    debug_print(f"[디버그] 스케일: {scale_factor}x")
+
+    if frame_files:
+        first_frame = frame_files[0]
+        first_input = os.path.join(input_dir_abs, first_frame)
+        first_output = os.path.join(output_dir_abs, first_frame)
+        upscale_cmd_example = (
+            f'"{UPSCAYL_PATH}" -i "{first_input}" -o "{first_output}" '
+            f'-s {scale_factor} -m "{model_path_abs}" -n {selected_model}'
+        )
+        debug_print(f"\n[디버그] Upscayl 명령어 예시: {upscale_cmd_example}")
+
+    work_args = [
+        (
+            frame_file,
+            input_dir_abs,
+            output_dir_abs,
+            UPSCAYL_PATH,
+            model_path_abs,
+            selected_model,
+            scale_factor,
+            ffmpeg_path,
+        )
+        for frame_file in frame_files
+    ]
+
+    failed_frames = []
+    completed_count = 0
+    upscale_start_time = time.time()
+
+    with tqdm(total=len(frame_files), desc=f"Upscaling ({res_name})", unit="frame") as pbar:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            work_queue = iter(work_args)
+            future_to_frame = {}
+
+            initial_batch_size = min(num_workers * 2, len(work_args))
+            for i, args in enumerate(work_args):
+                if i >= initial_batch_size:
+                    break
+                future = executor.submit(upscale_single_frame, args)
+                future_to_frame[future] = args[0]
+
+            while future_to_frame:
+                for future in as_completed(future_to_frame):
+                    frame_file = future_to_frame.pop(future)
+                    try:
+                        result = future.result()
+
+                        if completed_count == 0:
+                            debug_print(f"\n[디버그] 첫 번째 프레임 처리 완료: {result['frame_file']}")
+                            debug_print(f"[디버그] 종료 코드: {result['returncode']}")
+                            if result['stderr']:
+                                debug_print(f"[디버그] stderr:\n{result['stderr'][:500]}")
+
+                        if result['returncode'] != 0:
+                            failed_frames.append({
+                                'frame': result['frame_file'],
+                                'returncode': result['returncode'],
+                                'stderr': result['stderr'],
+                            })
+                            print(
+                                f"\n❌ 프레임 {result['frame_file']} 업스케일링 실패 "
+                                f"(종료 코드: {result['returncode']})"
+                            )
+                            if result['stderr']:
+                                print(f"에러: {result['stderr'][-300:]}")
+
+                        if not os.path.exists(result['output_path']):
+                            failed_frames.append({
+                                'frame': result['frame_file'],
+                                'returncode': -1,
+                                'stderr': f"업스케일된 파일이 생성되지 않았습니다: {result['output_path']}",
+                            })
+                            print(f"\n❌ 업스케일된 파일이 생성되지 않았습니다: {result['output_path']}")
+
+                        completed_count += 1
+                        pbar.update(1)
+
+                        try:
+                            next_args = next(work_queue)
+                            next_future = executor.submit(upscale_single_frame, next_args)
+                            future_to_frame[next_future] = next_args[0]
+                        except StopIteration:
+                            pass
+
+                    except Exception as e:
+                        failed_frames.append({
+                            'frame': frame_file,
+                            'returncode': -1,
+                            'stderr': str(e),
+                        })
+                        print(f"\n❌ 프레임 {frame_file} 처리 중 예외 발생: {e}")
+                        pbar.update(1)
+
+                        try:
+                            next_args = next(work_queue)
+                            next_future = executor.submit(upscale_single_frame, next_args)
+                            future_to_frame[next_future] = next_args[0]
+                        except StopIteration:
+                            pass
+
+                    break
+
+    if failed_frames:
+        error_msg = f"{len(failed_frames)}개의 프레임 업스케일링 실패:\n"
+        for fail in failed_frames[:5]:
+            error_msg += f"  - {fail['frame']}: {fail['stderr'][:100]}\n"
+        if len(failed_frames) > 5:
+            error_msg += f"  ... 외 {len(failed_frames) - 5}개\n"
+        raise Exception(error_msg)
+
+    final_count = len([f for f in os.listdir(upscaled_dir) if f.endswith('.png')])
+    if final_count < len(frame_files):
+        print(f"\n⚠️ 경고: 예상 {len(frame_files)}개 프레임 중 {final_count}개만 생성되었습니다.")
+
+    upscale_elapsed = time.time() - upscale_start_time
+    hours = int(upscale_elapsed // 3600)
+    minutes = int((upscale_elapsed % 3600) // 60)
+    seconds = int(upscale_elapsed % 60)
+
+    if hours > 0:
+        time_str = f"{hours}시간 {minutes}분 {seconds}초"
+    elif minutes > 0:
+        time_str = f"{minutes}분 {seconds}초"
+    else:
+        time_str = f"{seconds}초"
+
+    print(f"\n⏱️ 업스케일링 작업 완료: {time_str} ({upscale_elapsed:.2f}초)")
+    if frame_files:
+        print(f"   평균 프레임당 처리 시간: {upscale_elapsed / len(frame_files):.2f}초")
+
+def process_single_video(
+    video_path: Path,
+    output_dir: Path,
+    res_name: str,
+    target_w: int,
+    target_h: int,
+    selected_model: str,
+    model_index: int,
+    model_path_abs: str,
+    num_workers: int,
+) -> str:
+    """단일 동영상을 업스케일하고 결과 파일 경로를 반환합니다."""
+    video_path = video_path.resolve()
+    output_dir = output_dir.resolve()
+    temp_dir, upscaled_dir = get_work_dirs(output_dir)
+
+    width, height, fps, total_frames = get_video_info(str(video_path))
+    current_res_name = get_resolution_name(width, height)
+    if current_res_name:
+        print(
+            f"\n📺 현재 영상: {width}x{height} ({current_res_name}) - "
+            f"{fps} fps, 총 {total_frames} 프레임"
+        )
+    else:
+        print(
+            f"\n📺 현재 영상: {width}x{height} (비표준 해상도) - "
+            f"{fps} fps, 총 {total_frames} 프레임"
+        )
+
+    final_width, final_height, aspect_ratio = calculate_final_dimensions(
+        width, height, target_w, target_h
+    )
+    print(
+        f"📐 원본 비율 유지: {width}x{height} → {final_width}x{final_height} "
+        f"(비율: {aspect_ratio:.2f})"
+    )
+
+    scale_factor = 4 if final_width / width > 2 else 2
+    cleanup_work_dirs(temp_dir, upscaled_dir, verbose=False)
+
+    try:
+        print(f"\n[1/3] 🎞️ 프레임 추출 중...")
+        frame_pattern = temp_dir / "frame_%05d.png"
+        subprocess.run(
+            f'ffmpeg -i "{video_path}" -q:v 2 "{frame_pattern}"',
+            shell=True,
+            check=True,
+        )
+
+        print(f"\n[2/3] 🤖 AI 업스케일링 시작 ({res_name})...")
+        run_frame_upscale(
+            temp_dir,
+            upscaled_dir,
+            scale_factor,
+            model_path_abs,
+            selected_model,
+            num_workers,
+            res_name,
+        )
+
+        print(f"\n[3/3] 🎬 영상 합성 및 인코딩 중 (Encoder: {VIDEO_ENCODER})...")
+        output_name = build_output_filename(video_path.name, res_name, model_index)
+        output_path = output_dir / output_name
+
+        encoder_params = ""
+        if VIDEO_ENCODER == "h264_amf":
+            encoder_params = "-quality speed -rc cqp -qp_i 23 -qp_p 23"
+        elif VIDEO_ENCODER == "h264_nvenc":
+            encoder_params = "-preset fast"
+
+        upscaled_pattern = upscaled_dir / "frame_%05d.png"
+        merge_cmd = (
+            f'ffmpeg -y -framerate {fps} -i "{upscaled_pattern}" -i "{video_path}" '
+            f'-vf "scale={final_width}:{final_height}:flags=lanczos" '
+            f'-c:v {VIDEO_ENCODER} {encoder_params} -pix_fmt yuv420p -c:a copy '
+            f'-map 0:v:0 -map 1:a:0? "{output_path}"'
+        )
+        subprocess.run(merge_cmd, shell=True, check=True)
+        print(f"\n✅ 성공! 결과물: {output_path}")
+        return str(output_path)
+
+    finally:
+        cleanup_work_dirs(temp_dir, upscaled_dir)
 
 def get_resolution_name(width, height):
     """해상도에 맞는 표준 해상도 이름을 반환합니다."""
@@ -468,356 +889,89 @@ def get_video_info(video_path):
     
     return w, h, fps, total_frames
 
-def cleanup():
-    """작업용 임시 폴더 삭제"""
-    if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
-    if os.path.exists(UPSCALED_DIR): shutil.rmtree(UPSCALED_DIR)
-    print("🧹 임시 파일 정리가 완료되었습니다.")
+def run_upscale(input_path: str | None = None):
+    result = resolve_input_videos(input_path)
+    if result is None:
+        return
 
-def run_upscale():
-    # 1. 파일 선택
-    video_files = [f for f in os.listdir('.') if f.endswith('.mp4') and not is_upscaled_output(f)]
-    if not video_files:
-        print("❌ MP4 파일을 찾을 수 없습니다."); return
-    
-    if len(video_files) == 1:
-        selected_video = video_files[0]
-    else:
-        for i, f in enumerate(video_files): print(f"[{i+1}] {f}")
-        selected_video = video_files[int(input("\n번호 선택: "))-1]
-    
-    print(f"\n5. 📁 선택된 파일: {selected_video}")
+    videos, output_dir = result
 
-    # 2. 정보 및 해상도 선택
-    width, height, fps, total_frames = get_video_info(selected_video)
-    current_res_name = get_resolution_name(width, height)
-    if current_res_name:
-        print(f"\n6. 📺 현재 영상: {width}x{height} ({current_res_name}) - {fps} fps, 총 {total_frames} 프레임")
-    else:
-        print(f"\n6. 📺 현재 영상: {width}x{height} (비표준 해상도) - {fps} fps, 총 {total_frames} 프레임")
-    
-    # 원본 영상의 비율 계산
-    aspect_ratio = width / height
-    
-    # 목표 해상도 선택 메뉴 생성
-    res_menu = ", ".join([f"{key}:{name}({w}x{h})" for key, (name, w, h) in RES_OPTIONS.items()])
-    res_name, target_w, target_h = RES_OPTIONS.get(input(f"7. 목표 해상도 ({res_menu}): "), RES_OPTIONS["2"])
-    
-    # 원본 비율을 유지하면서 목표 해상도에 맞춤
-    # 목표 해상도의 비율
-    target_aspect = target_w / target_h
-    
-    if aspect_ratio > target_aspect:
-        # 원본이 더 넓음 (가로가 더 긴 경우) - 높이를 기준으로 너비 계산
-        final_height = target_h
-        final_width = int(target_h * aspect_ratio)
-        # 최대 너비 제한 (목표 해상도보다 크지 않도록)
-        if final_width > target_w:
-            final_width = target_w
-            final_height = int(target_w / aspect_ratio)
-    else:
-        # 원본이 더 높음 (세로가 더 긴 경우) - 너비를 기준으로 높이 계산
-        final_width = target_w
-        final_height = int(target_w / aspect_ratio)
-        # 최대 높이 제한 (목표 해상도보다 크지 않도록)
-        if final_height > target_h:
-            final_height = target_h
-            final_width = int(target_h * aspect_ratio)
-    
-    # 짝수로 맞춤 (비디오 인코딩 호환성)
-    final_width = final_width - (final_width % 2)
-    final_height = final_height - (final_height % 2)
-    
-    # 최종 해상도 정보 표시
-    print(f"\n📐 원본 비율 유지: {width}x{height} → {final_width}x{final_height} (비율: {aspect_ratio:.2f})")
-    
-    scale_factor = 4 if final_width / width > 2 else 2
+    print(f"\n📂 저장 위치: {output_dir}")
+    print(f"\n📋 처리 대상 ({len(videos)}개):")
+    for i, video in enumerate(videos, 1):
+        print(f"  [{i}] {video.name}")
 
-    # 3. 폴더 초기화
-    cleanup()
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    os.makedirs(UPSCALED_DIR, exist_ok=True)
+    if len(videos) > 1:
+        confirm = input("\n일괄 처리를 시작하시겠습니까? (Enter=계속, n=취소): ").strip().lower()
+        if confirm == 'n':
+            print("작업이 취소되었습니다.")
+            return
+    elif len(videos) == 1:
+        print(f"\n5. 📁 선택된 파일: {videos[0].name}")
 
+    res_name, target_w, target_h = prompt_resolution()
+
+    model_path_abs = os.path.abspath(MODEL_PATH) if os.path.exists(MODEL_PATH) else MODEL_PATH
     try:
-        # 4. 프레임 추출
-        print(f"\n[1/3] 🎞️ 프레임 추출 중...")
-        subprocess.run(f'ffmpeg -i "{selected_video}" -q:v 2 "{TEMP_DIR}/frame_%05d.png"', shell=True, check=True)
+        selected_model, model_index = prompt_model(model_path_abs)
+    except KeyboardInterrupt:
+        print("\n\n작업이 취소되었습니다.")
+        return
 
-        # 5. AI 업스케일링 (폴더 전체를 배치로 처리)
-        print(f"\n[2/3] 🤖 AI 업스케일링 시작 ({res_name})...")
-        
-        # 업스케일링 작업 시작 시간 기록
-        upscale_start_time = time.time()
-        
-        # 모델 폴더에서 사용 가능한 모델 찾기
-        model_path_abs = os.path.abspath(MODEL_PATH) if os.path.exists(MODEL_PATH) else MODEL_PATH
-        available_models = find_available_models(model_path_abs)
-        
-        if not available_models:
-            raise Exception(f"모델 폴더에서 사용 가능한 모델을 찾을 수 없습니다: {model_path_abs}")
-        
-        # 가장 빠른 모델을 기본값으로 설정
-        fastest_model = get_fastest_model(available_models)
-        default_index = available_models.index(fastest_model) + 1 if fastest_model in available_models else 1
-        
-        # 사용자가 모델 선택
-        if len(available_models) == 1:
-            selected_model = available_models[0]
-            model_index = 1
-            print(f"\n📦 사용할 모델: {selected_model} (자동 선택)")
-        else:
-            print(f"\n📦 사용 가능한 모델:")
-            for i, model in enumerate(available_models, 1):
-                marker = " ⚡ (가장 빠름)" if model == fastest_model else ""
-                print(f"  [{i}] {model}{marker}")
-            
-            while True:
-                try:
-                    choice = input(f"\n모델 선택 (1-{len(available_models)}, 기본값: {default_index}): ").strip()
-                    if not choice:
-                        choice = str(default_index)
-                    choice_num = int(choice)
-                    if 1 <= choice_num <= len(available_models):
-                        selected_model = available_models[choice_num - 1]
-                        model_index = choice_num
-                        break
-                    else:
-                        print(f"❌ 1부터 {len(available_models)} 사이의 숫자를 입력하세요.")
-                except ValueError:
-                    print("❌ 숫자를 입력하세요.")
-                except KeyboardInterrupt:
-                    print("\n\n작업이 취소되었습니다.")
-                    return
-            
-            print(f"✅ 선택된 모델: {selected_model}")
-        
-        # temp_frames 폴더의 모든 PNG 파일 확인
-        frame_files = sorted([f for f in os.listdir(TEMP_DIR) if f.endswith('.png')])
-        if not frame_files:
-            raise Exception(f"{TEMP_DIR} 폴더에 프레임 파일이 없습니다.")
-        
-        # 절대 경로로 변환
-        input_dir_abs = os.path.abspath(TEMP_DIR)
-        output_dir_abs = os.path.abspath(UPSCALED_DIR)
-        
-        # CPU/GPU 정보 확인 및 최적 워커 수 계산
-        cpu_count = get_cpu_info()
-        gpu_count = get_gpu_info()
-        has_gpu_encoder = VIDEO_ENCODER in ['h264_nvenc', 'h264_amf']
-        
-        print(f"\n[시스템 정보]")
-        print(f"  CPU 코어 수: {cpu_count}")
-        if gpu_count > 0:
-            print(f"  GPU 개수: {gpu_count}")
-        else:
-            print(f"  GPU: 감지되지 않음")
-        
-        # 최적 워커 수 계산
-        recommended_workers = calculate_optimal_workers(cpu_count, gpu_count, has_gpu_encoder)
-        
-        # 사용자에게 워커 수 확인
-        print(f"\n[병렬 처리 설정]")
-        print(f"  권장 워커 수: {recommended_workers}")
+    cpu_count = get_cpu_info()
+    gpu_count = get_gpu_info()
+    has_gpu_encoder = VIDEO_ENCODER in ['h264_nvenc', 'h264_amf']
+    recommended_workers = calculate_optimal_workers(cpu_count, gpu_count, has_gpu_encoder)
+    try:
+        num_workers = prompt_workers(recommended_workers, cpu_count)
+    except KeyboardInterrupt:
+        print("\n\n작업이 취소되었습니다.")
+        return
+
+    print(f"\n[시스템 정보]")
+    print(f"  CPU 코어 수: {cpu_count}")
+    print(f"  GPU 개수: {gpu_count}" if gpu_count > 0 else "  GPU: 감지되지 않음")
+    print(f"  ✅ {num_workers}개의 워커로 병렬 처리합니다.")
+
+    print(f"\n{'=' * 60}")
+    print(f"🚀 업스케일 시작: {len(videos)}개 파일 | {res_name} | 모델 M{model_index}")
+    print(f"{'=' * 60}")
+
+    succeeded = []
+    failed = []
+
+    for index, video_path in enumerate(videos, 1):
+        print(f"\n{'─' * 60}")
+        print(f"[{index}/{len(videos)}] 🎬 {video_path.name}")
+        print(f"{'─' * 60}")
         try:
-            worker_input = input(f"  사용할 워커 수 (기본값: {recommended_workers}, Enter로 기본값 사용): ").strip()
-            if worker_input:
-                num_workers = int(worker_input)
-                if num_workers < 1:
-                    print("  ⚠️ 워커 수는 1 이상이어야 합니다. 기본값을 사용합니다.")
-                    num_workers = recommended_workers
-                elif num_workers > cpu_count * 2:
-                    print(f"  ⚠️ 워커 수가 너무 많습니다. CPU 코어 수({cpu_count})의 2배를 초과합니다.")
-                    confirm = input(f"  계속하시겠습니까? (y/n, 기본값: n): ").strip().lower()
-                    if confirm != 'y':
-                        num_workers = recommended_workers
-            else:
-                num_workers = recommended_workers
-        except (ValueError, KeyboardInterrupt):
-            print("  기본값을 사용합니다.")
-            num_workers = recommended_workers
-        
-        print(f"  ✅ {num_workers}개의 워커로 병렬 처리합니다.")
-        
-        # Upscayl 명령어: 폴더 전체를 배치로 처리
-        # 각 파일에 대해 절대 경로 + 파일명으로 출력 지정
-        debug_print(f"\n[디버그] 입력 폴더: {input_dir_abs}")
-        debug_print(f"[디버그] 출력 폴더: {output_dir_abs}")
-        debug_print(f"[디버그] 모델: {selected_model}")
-        debug_print(f"[디버그] 스케일: {scale_factor}x")
-        
-        # 첫 번째 프레임에 대한 명령어 예시 출력
-        if frame_files:
-            first_frame = frame_files[0]
-            first_input = os.path.join(input_dir_abs, first_frame)
-            first_output = os.path.join(output_dir_abs, first_frame)
-            upscale_cmd_example = f'"{UPSCAYL_PATH}" -i "{first_input}" -o "{first_output}" -s {scale_factor} -m "{model_path_abs}" -n {selected_model}'
-            debug_print(f"\n[디버그] Upscayl 명령어 예시: {upscale_cmd_example}")
-        
-        # 병렬 처리 준비: 각 프레임에 대한 작업 인자 생성
-        work_args = [
-            (
-                frame_file,
-                input_dir_abs,
-                output_dir_abs,
-                UPSCAYL_PATH,
-                model_path_abs,
+            output_path = process_single_video(
+                video_path,
+                output_dir,
+                res_name,
+                target_w,
+                target_h,
                 selected_model,
-                scale_factor,
-                ffmpeg_path
+                model_index,
+                model_path_abs,
+                num_workers,
             )
-            for frame_file in frame_files
-        ]
-        
-        # 병렬 처리 실행
-        # 작업 큐를 사용하여 워커가 작업을 완료하면 즉시 다음 작업을 가져오도록 최적화
-        failed_frames = []
-        completed_count = 0
-        
-        with tqdm(total=len(frame_files), desc="Upscaling", unit="frame") as pbar:
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                # 작업 큐: 워커 수의 2-3배만큼 미리 제출하여 GPU를 지속적으로 활용
-                # 나머지는 워커가 작업을 완료할 때마다 동적으로 제출
-                work_queue = iter(work_args)
-                future_to_frame = {}
-                
-                # 초기 작업 제출: 워커 수의 2배만큼 미리 제출
-                initial_batch_size = min(num_workers * 2, len(work_args))
-                for i, args in enumerate(work_args):
-                    if i >= initial_batch_size:
-                        break
-                    future = executor.submit(upscale_single_frame, args)
-                    future_to_frame[future] = args[0]
-                
-                # 완료된 작업 처리 및 새 작업 제출
-                pending_count = initial_batch_size
-                
-                while future_to_frame:
-                    # 완료된 작업 처리
-                    for future in as_completed(future_to_frame):
-                        frame_file = future_to_frame.pop(future)
-                        try:
-                            result = future.result()
-                            
-                            # 첫 번째 완료된 프레임에 대한 디버그 정보 출력
-                            if completed_count == 0:
-                                debug_print(f"\n[디버그] 첫 번째 프레임 처리 완료: {result['frame_file']}")
-                                debug_print(f"[디버그] 종료 코드: {result['returncode']}")
-                                if result['stderr']:
-                                    debug_print(f"[디버그] stderr:\n{result['stderr'][:500]}")
-                            
-                            # 에러 확인
-                            if result['returncode'] != 0:
-                                failed_frames.append({
-                                    'frame': result['frame_file'],
-                                    'returncode': result['returncode'],
-                                    'stderr': result['stderr']
-                                })
-                                print(f"\n❌ 프레임 {result['frame_file']} 업스케일링 실패 (종료 코드: {result['returncode']})")
-                                if result['stderr']:
-                                    print(f"에러: {result['stderr'][-300:]}")
-                            
-                            # 출력 파일 확인
-                            if not os.path.exists(result['output_path']):
-                                failed_frames.append({
-                                    'frame': result['frame_file'],
-                                    'returncode': -1,
-                                    'stderr': f"업스케일된 파일이 생성되지 않았습니다: {result['output_path']}"
-                                })
-                                print(f"\n❌ 업스케일된 파일이 생성되지 않았습니다: {result['output_path']}")
-                            
-                            completed_count += 1
-                            pbar.update(1)
-                            
-                            # 워커가 작업을 완료하면 즉시 다음 작업 제출 (GPU 유휴 시간 최소화)
-                            try:
-                                next_args = next(work_queue)
-                                next_future = executor.submit(upscale_single_frame, next_args)
-                                future_to_frame[next_future] = next_args[0]
-                                pending_count += 1
-                            except StopIteration:
-                                # 더 이상 제출할 작업이 없음
-                                pass
-                            
-                        except Exception as e:
-                            failed_frames.append({
-                                'frame': frame_file,
-                                'returncode': -1,
-                                'stderr': str(e)
-                            })
-                            print(f"\n❌ 프레임 {frame_file} 처리 중 예외 발생: {e}")
-                            pbar.update(1)
-                            
-                            # 예외가 발생해도 다음 작업 제출 시도
-                            try:
-                                next_args = next(work_queue)
-                                next_future = executor.submit(upscale_single_frame, next_args)
-                                future_to_frame[next_future] = next_args[0]
-                                pending_count += 1
-                            except StopIteration:
-                                pass
-                        
-                        # 한 번에 하나씩 처리하므로 break
-                        break
-        
-        # 실패한 프레임이 있으면 에러 발생
-        if failed_frames:
-            error_msg = f"{len(failed_frames)}개의 프레임 업스케일링 실패:\n"
-            for fail in failed_frames[:5]:  # 최대 5개만 표시
-                error_msg += f"  - {fail['frame']}: {fail['stderr'][:100]}\n"
-            if len(failed_frames) > 5:
-                error_msg += f"  ... 외 {len(failed_frames) - 5}개\n"
-            raise Exception(error_msg)
-        
-        final_count = len([f for f in os.listdir(UPSCALED_DIR) if f.endswith('.png')])
-        if final_count < len(frame_files):
-            print(f"\n⚠️ 경고: 예상 {len(frame_files)}개 프레임 중 {final_count}개만 생성되었습니다.")
+            succeeded.append((video_path.name, output_path))
+        except Exception as e:
+            print(f"\n❌ 오류 발생 ({video_path.name}): {e}")
+            failed.append((video_path.name, str(e)))
 
-        # 업스케일링 작업 완료 시간 계산 및 표시
-        upscale_end_time = time.time()
-        upscale_elapsed = upscale_end_time - upscale_start_time
-        hours = int(upscale_elapsed // 3600)
-        minutes = int((upscale_elapsed % 3600) // 60)
-        seconds = int(upscale_elapsed % 60)
-        
-        if hours > 0:
-            time_str = f"{hours}시간 {minutes}분 {seconds}초"
-        elif minutes > 0:
-            time_str = f"{minutes}분 {seconds}초"
-        else:
-            time_str = f"{seconds}초"
-        
-        print(f"\n⏱️ 업스케일링 작업 완료: {time_str} ({upscale_elapsed:.2f}초)")
-        if len(frame_files) > 0:
-            avg_time_per_frame = upscale_elapsed / len(frame_files)
-            print(f"   평균 프레임당 처리 시간: {avg_time_per_frame:.2f}초")
-
-        # 6. 최종 합성 (GPU 가속 사용)
-        print(f"\n[3/3] 🎬 영상 합성 및 인코딩 중 (Encoder: {VIDEO_ENCODER})...")
-        output_name = build_output_filename(selected_video, res_name, model_index)
-        
-        # 인코더별 추가 파라미터 설정
-        encoder_params = ""
-        if VIDEO_ENCODER == "h264_amf":
-            # AMD AMF 인코더에 적절한 파라미터 추가
-            encoder_params = "-quality speed -rc cqp -qp_i 23 -qp_p 23"
-        elif VIDEO_ENCODER == "h264_nvenc":
-            # NVIDIA NVENC 인코더에 적절한 파라미터 추가 (선택사항)
-            encoder_params = "-preset fast"
-        
-        merge_cmd = (
-            f'ffmpeg -y -framerate {fps} -i "{UPSCALED_DIR}/frame_%05d.png" -i "{selected_video}" '
-            f'-vf "scale={final_width}:{final_height}:flags=lanczos" '
-            f'-c:v {VIDEO_ENCODER} {encoder_params} -pix_fmt yuv420p -c:a copy -map 0:v:0 -map 1:a:0? "{output_name}"'
-        )
-        subprocess.run(merge_cmd, shell=True, check=True)
-
-        print(f"\n✅ 성공! 결과물: {output_name}")
-
-    except Exception as e:
-        print(f"\n❌ 오류 발생: {e}")
-    finally:
-        # 7. 마무리 정리 (자동으로 임시 파일 삭제)
-        cleanup()
+    print(f"\n{'=' * 60}")
+    print("📊 작업 요약")
+    print(f"{'=' * 60}")
+    print(f"  ✅ 성공: {len(succeeded)}개")
+    for name, path in succeeded:
+        print(f"     - {name} → {Path(path).name}")
+    if failed:
+        print(f"  ❌ 실패: {len(failed)}개")
+        for name, error in failed:
+            print(f"     - {name}: {error[:80]}")
+    print(f"{'=' * 60}")
 
 if __name__ == "__main__":
     # Windows에서 multiprocessing을 사용할 때 필요
@@ -859,4 +1013,4 @@ if __name__ == "__main__":
     globals()['VIDEO_ENCODER'] = VIDEO_ENCODER
     globals()['ffmpeg_path'] = ffmpeg_path
     
-    run_upscale()
+    run_upscale(args.input)

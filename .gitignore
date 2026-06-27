@@ -31,6 +31,7 @@ dist/
 # 임시 파일
 temp_frames/
 upscaled_frames/
+.upscayv_temp/
 output_*.mp4
 *_HD_M*.mp4
 *_FHD_M*.mp4
