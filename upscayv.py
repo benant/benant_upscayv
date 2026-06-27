@@ -5,10 +5,8 @@ import json
 import shutil
 import time
 import argparse
-import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
@@ -459,8 +457,97 @@ def collect_videos(folder: Path) -> list[Path]:
             videos.append(item)
     return videos
 
+SKIP_DIR_NAMES = {
+    WORK_TEMP_DIR,
+    TEMP_DIR,
+    UPSCALED_DIR,
+    "__pycache__",
+    ".git",
+    ".vscode",
+    ".idea",
+    "dist",
+    "build",
+    "venv",
+    "env",
+    ".venv",
+}
+
+def is_selectable_folder(path: Path) -> bool:
+    """선택 목록에 표시할 하위 폴더인지 확인합니다."""
+    return path.is_dir() and path.name not in SKIP_DIR_NAMES and not path.name.startswith(".")
+
+def list_folders_with_videos(base: Path) -> list[tuple[Path, int]]:
+    """현재 위치의 하위 폴더 중 MP4가 있는 폴더 목록을 반환합니다."""
+    folders = []
+    for item in sorted(base.iterdir()):
+        if not is_selectable_folder(item):
+            continue
+        count = len(collect_videos(item))
+        if count > 0:
+            folders.append((item, count))
+    return folders
+
+def list_videos_in_folder(base: Path) -> list[Path]:
+    """현재 위치의 업스케일 대상 MP4 파일 목록을 반환합니다."""
+    return collect_videos(base)
+
+def prompt_number_choice(max_index: int, prompt: str) -> int | None:
+    """1부터 max_index까지 번호를 입력받습니다."""
+    while True:
+        raw = input(prompt).strip()
+        if not raw:
+            return None
+        try:
+            choice = int(raw)
+        except ValueError:
+            print("❌ 숫자를 입력하세요.")
+            continue
+        if 1 <= choice <= max_index:
+            return choice
+        print(f"❌ 1부터 {max_index} 사이의 숫자를 입력하세요.")
+
+def select_video_file(base: Path) -> Path | None:
+    """현재 폴더에서 동영상 파일 하나를 선택합니다."""
+    videos = list_videos_in_folder(base)
+    if not videos:
+        print(f"❌ 현재 폴더에서 MP4 파일을 찾을 수 없습니다: {base}")
+        return None
+
+    print(f"\n📂 현재 위치: {base}")
+    print(f"\n동영상 파일 ({len(videos)}개):")
+    for i, video in enumerate(videos, 1):
+        print(f"  [{i}] {video.name}")
+
+    if len(videos) == 1:
+        print(f"\n✅ 자동 선택: {videos[0].name}")
+        return videos[0]
+
+    choice = prompt_number_choice(len(videos), "\n번호 선택: ")
+    if choice is None:
+        print("❌ 선택이 취소되었습니다.")
+        return None
+    return videos[choice - 1]
+
+def select_target_folder(base: Path) -> Path | None:
+    """현재 폴더의 하위 폴더 중 하나를 선택합니다."""
+    folders = list_folders_with_videos(base)
+    if not folders:
+        print(f"❌ 현재 위치에 MP4가 있는 하위 폴더가 없습니다: {base}")
+        return None
+
+    print(f"\n📂 현재 위치: {base}")
+    print(f"\n하위 폴더 ({len(folders)}개):")
+    for i, (folder, count) in enumerate(folders, 1):
+        print(f"  [{i}] {folder.name}  ({count}개 MP4)")
+
+    choice = prompt_number_choice(len(folders), "\n번호 선택: ")
+    if choice is None:
+        print("❌ 선택이 취소되었습니다.")
+        return None
+    return folders[choice - 1][0]
+
 def resolve_input_videos(input_path: str | None) -> tuple[list[Path], Path] | None:
-    """입력 경로 또는 대화상자로 동영상 목록과 저장 폴더를 결정합니다."""
+    """입력 경로 또는 현재 폴더 목록으로 동영상과 저장 위치를 결정합니다."""
     if input_path:
         path = Path(input_path).expanduser().resolve()
         if not path.exists():
@@ -480,13 +567,12 @@ def resolve_input_videos(input_path: str | None) -> tuple[list[Path], Path] | No
         print(f"❌ 유효하지 않은 경로입니다: {path}")
         return None
 
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
+    base = Path.cwd().resolve()
 
     print("\n5. 📁 입력 선택")
-    print("  [1] 동영상 파일 선택")
-    print("  [2] 폴더 선택 (폴더 내 모든 MP4 일괄 처리)")
+    print(f"  현재 위치: {base}")
+    print("  [1] 동영상 파일 선택 (현재 폴더)")
+    print("  [2] 폴더 선택 (현재 폴더 내 하위 폴더 일괄 처리)")
 
     while True:
         choice = input("선택 (1/2, 기본값: 1): ").strip() or "1"
@@ -495,28 +581,16 @@ def resolve_input_videos(input_path: str | None) -> tuple[list[Path], Path] | No
         print("❌ 1 또는 2를 입력하세요.")
 
     if choice == "2":
-        folder = filedialog.askdirectory(title="업스케일할 동영상 폴더 선택")
-        root.destroy()
-        if not folder:
-            print("❌ 폴더 선택이 취소되었습니다.")
+        folder = select_target_folder(base)
+        if folder is None:
             return None
-        folder_path = Path(folder).resolve()
-        videos = collect_videos(folder_path)
-        if not videos:
-            print(f"❌ 폴더에서 MP4 파일을 찾을 수 없습니다: {folder_path}")
-            return None
-        return videos, folder_path
+        videos = collect_videos(folder)
+        return videos, folder
 
-    file_path = filedialog.askopenfilename(
-        title="업스케일할 동영상 선택",
-        filetypes=[("MP4 files", "*.mp4"), ("All files", "*.*")],
-    )
-    root.destroy()
-    if not file_path:
-        print("❌ 파일 선택이 취소되었습니다.")
+    video = select_video_file(base)
+    if video is None:
         return None
-    video_path = Path(file_path).resolve()
-    return [video_path], video_path.parent
+    return [video], base
 
 def calculate_final_dimensions(width, height, target_w, target_h):
     """원본 비율을 유지하면서 목표 해상도에 맞는 최종 크기를 계산합니다."""
@@ -811,12 +885,13 @@ def process_single_video(
 
     scale_factor = 4 if final_width / width > 2 else 2
     cleanup_work_dirs(temp_dir, upscaled_dir, verbose=False)
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         print(f"\n[1/3] 🎞️ 프레임 추출 중...")
         frame_pattern = temp_dir / "frame_%05d.png"
         subprocess.run(
-            f'ffmpeg -i "{video_path}" -q:v 2 "{frame_pattern}"',
+            f'ffmpeg -y -i "{video_path}" -q:v 2 "{frame_pattern}"',
             shell=True,
             check=True,
         )
