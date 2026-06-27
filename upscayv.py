@@ -1,9 +1,11 @@
 import os
+import re
 import subprocess
 import json
 import shutil
 import time
 import argparse
+from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -419,6 +421,20 @@ RES_OPTIONS = {
     "4": ("8K", 7680, 4320)
 }
 
+def build_output_filename(video_filename, res_name, model_index):
+    """업스케일 결과 파일명을 생성합니다. 예: 17-2_FHD_M7_20250627_143052.mp4"""
+    stem = os.path.splitext(video_filename)[0]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{stem}_{res_name}_M{model_index}_{timestamp}.mp4"
+
+def is_upscaled_output(filename):
+    """업스케일 결과물 파일명인지 확인합니다."""
+    if not filename.endswith('.mp4'):
+        return False
+    stem = os.path.splitext(filename)[0]
+    res_pattern = '|'.join(re.escape(name) for name, _, _ in RES_OPTIONS.values())
+    return re.match(rf'.+_({res_pattern})_M\d+_\d{{8}}_\d{{6}}$', stem) is not None
+
 def get_resolution_name(width, height):
     """해상도에 맞는 표준 해상도 이름을 반환합니다."""
     # 해상도 매칭 (약간의 오차 허용)
@@ -460,7 +476,7 @@ def cleanup():
 
 def run_upscale():
     # 1. 파일 선택
-    video_files = [f for f in os.listdir('.') if f.endswith('.mp4') and not f.startswith('output_')]
+    video_files = [f for f in os.listdir('.') if f.endswith('.mp4') and not is_upscaled_output(f)]
     if not video_files:
         print("❌ MP4 파일을 찾을 수 없습니다."); return
     
@@ -547,6 +563,7 @@ def run_upscale():
         # 사용자가 모델 선택
         if len(available_models) == 1:
             selected_model = available_models[0]
+            model_index = 1
             print(f"\n📦 사용할 모델: {selected_model} (자동 선택)")
         else:
             print(f"\n📦 사용 가능한 모델:")
@@ -562,6 +579,7 @@ def run_upscale():
                     choice_num = int(choice)
                     if 1 <= choice_num <= len(available_models):
                         selected_model = available_models[choice_num - 1]
+                        model_index = choice_num
                         break
                     else:
                         print(f"❌ 1부터 {len(available_models)} 사이의 숫자를 입력하세요.")
@@ -775,7 +793,7 @@ def run_upscale():
 
         # 6. 최종 합성 (GPU 가속 사용)
         print(f"\n[3/3] 🎬 영상 합성 및 인코딩 중 (Encoder: {VIDEO_ENCODER})...")
-        output_name = f"output_{res_name}_{selected_video}"
+        output_name = build_output_filename(selected_video, res_name, model_index)
         
         # 인코더별 추가 파라미터 설정
         encoder_params = ""

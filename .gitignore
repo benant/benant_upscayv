@@ -32,6 +32,10 @@ dist/
 temp_frames/
 upscaled_frames/
 output_*.mp4
+*_HD_M*.mp4
+*_FHD_M*.mp4
+*_4K_M*.mp4
+*_8K_M*.mp4
 
 # IDE
 .vscode/
